@@ -19,4 +19,5 @@ target_compile_definitions(vector_mac PRIVATE CL_TARGET_OPENCL_VERSION=120)
 target_link_libraries(vector_mac PRIVATE ${OpenCL_LIBRARIES})
 
 # Copy kernel file to build directory
-configure_file(vector_mac.cl ${CMAKE_CURRENT_BINARY_DIR}/vector_mac.cl COPYONLY)
+configure_file(vector_mac_seq.cl ${CMAKE_CURRENT_BINARY_DIR}/vector_mac_seq.cl COPYONLY)
+configure_file(vector_mac_par.cl ${CMAKE_CURRENT_BINARY_DIR}/vector_mac_par.cl COPYONLY)

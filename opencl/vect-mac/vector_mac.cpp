@@ -230,18 +230,25 @@ int main(int argc, char* argv[]) {
     // Start timing GPU data transfer (write)
     auto gpu_transfer_write_start = std::chrono::high_resolution_clock::now();
 
-    // Write data to pinned buffers
+    // Write data to buffers asynchronously
+    std::vector<cl_event> write_events(num_operations * 2); // Events for a and b buffers
     for (int op = 0; op < num_operations; ++op) {
-        void* ptrA = clEnqueueMapBuffer(queue, bufferA[op], CL_TRUE, CL_MAP_WRITE, 0, sizeof(int32_t) * SIZE, 0, nullptr, nullptr, &err);
-        void* ptrB = clEnqueueMapBuffer(queue, bufferB[op], CL_TRUE, CL_MAP_WRITE, 0, sizeof(int32_t) * SIZE, 0, nullptr, nullptr, &err);
+        err = clEnqueueWriteBuffer(queue, bufferA[op], CL_FALSE, 0, sizeof(int32_t) * SIZE, a[op].data(), 0, nullptr, &write_events[op * 2]);
         if (err != CL_SUCCESS) {
-            std::cerr << "Failed to map buffers for operation " << op << ": " << err << std::endl;
+            std::cerr << "Failed to enqueue write buffer A for operation " << op << ": " << err << std::endl;
             return 1;
         }
-        std::memcpy(ptrA, a[op].data(), sizeof(int32_t) * SIZE);
-        std::memcpy(ptrB, b[op].data(), sizeof(int32_t) * SIZE);
-        clEnqueueUnmapMemObject(queue, bufferA[op], ptrA, 0, nullptr, nullptr);
-        clEnqueueUnmapMemObject(queue, bufferB[op], ptrB, 0, nullptr, nullptr);
+        err = clEnqueueWriteBuffer(queue, bufferB[op], CL_FALSE, 0, sizeof(int32_t) * SIZE, b[op].data(), 0, nullptr, &write_events[op * 2 + 1]);
+        if (err != CL_SUCCESS) {
+            std::cerr << "Failed to enqueue write buffer B for operation " << op << ": " << err << std::endl;
+            return 1;
+        }
+    }
+
+    // Wait for all write operations to complete
+    clWaitForEvents(write_events.size(), write_events.data());
+    for (auto& event : write_events) {
+        clReleaseEvent(event);
     }
 
     // End timing GPU data transfer (write)
@@ -253,6 +260,8 @@ int main(int argc, char* argv[]) {
     auto gpu_mac_start = std::chrono::high_resolution_clock::now();
 
     // Enqueue kernels based on mode
+    std::vector<cl_event> kernel_events(num_operations * (is_parallel ? 3 : 1));
+    size_t event_idx = 0;
     for (int op = 0; op < num_operations; ++op) {
         if (is_parallel) {
             // Set arguments for products kernel
@@ -260,7 +269,7 @@ int main(int argc, char* argv[]) {
             clSetKernelArg(kernel_products, 1, sizeof(cl_mem), &bufferB[op]);
             clSetKernelArg(kernel_products, 2, sizeof(cl_mem), &bufferProducts[op]);
             clSetKernelArg(kernel_products, 3, sizeof(unsigned int), &size_uint);
-            err = clEnqueueNDRangeKernel(queue, kernel_products, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(queue, kernel_products, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, &kernel_events[event_idx++]);
             if (err != CL_SUCCESS) {
                 std::cerr << "Failed to enqueue products kernel for operation " << op << ": " << err << std::endl;
                 return 1;
@@ -272,7 +281,7 @@ int main(int argc, char* argv[]) {
             clSetKernelArg(kernel_block_scan, 2, sizeof(cl_mem), &bufferBlockSums[op]);
             clSetKernelArg(kernel_block_scan, 3, sizeof(unsigned int), &size_uint);
             clSetKernelArg(kernel_block_scan, 4, sizeof(int) * localWorkSize, nullptr); // Local memory for scratch
-            err = clEnqueueNDRangeKernel(queue, kernel_block_scan, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(queue, kernel_block_scan, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, &kernel_events[event_idx++]);
             if (err != CL_SUCCESS) {
                 std::cerr << "Failed to enqueue block scan kernel for operation " << op << ": " << err << std::endl;
                 return 1;
@@ -305,7 +314,7 @@ int main(int argc, char* argv[]) {
             clSetKernelArg(kernel_block_combine, 0, sizeof(cl_mem), &bufferC[op]);
             clSetKernelArg(kernel_block_combine, 1, sizeof(cl_mem), &bufferBlockSums[op]);
             clSetKernelArg(kernel_block_combine, 2, sizeof(unsigned int), &size_uint);
-            err = clEnqueueNDRangeKernel(queue, kernel_block_combine, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(queue, kernel_block_combine, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, &kernel_events[event_idx++]);
             if (err != CL_SUCCESS) {
                 std::cerr << "Failed to enqueue block combine kernel for operation " << op << ": " << err << std::endl;
                 return 1;
@@ -316,7 +325,7 @@ int main(int argc, char* argv[]) {
             clSetKernelArg(kernel_seq, 1, sizeof(cl_mem), &bufferB[op]);
             clSetKernelArg(kernel_seq, 2, sizeof(cl_mem), &bufferC[op]);
             clSetKernelArg(kernel_seq, 3, sizeof(unsigned int), &size_uint);
-            err = clEnqueueNDRangeKernel(queue, kernel_seq, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(queue, kernel_seq, 1, nullptr, &globalWorkSize, &localWorkSize, 0, nullptr, &kernel_events[event_idx++]);
             if (err != CL_SUCCESS) {
                 std::cerr << "Failed to enqueue sequential kernel for operation " << op << ": " << err << std::endl;
                 return 1;
@@ -324,8 +333,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Finish all kernel executions
-    clFinish(queue);
+    // Wait for all kernel executions to complete
+    clWaitForEvents(kernel_events.size(), kernel_events.data());
+    for (auto& event : kernel_events) {
+        clReleaseEvent(event);
+    }
 
     // End timing GPU MAC computation
     auto gpu_mac_end = std::chrono::high_resolution_clock::now();
@@ -337,14 +349,19 @@ int main(int argc, char* argv[]) {
     auto gpu_transfer_read_start = std::chrono::high_resolution_clock::now();
 
     // Read results for all operations
+    std::vector<cl_event> read_events(num_operations);
     for (int op = 0; op < num_operations; ++op) {
-        void* ptrC = clEnqueueMapBuffer(queue, bufferC[op], CL_TRUE, CL_MAP_READ, 0, sizeof(int32_t) * SIZE, 0, nullptr, nullptr, &err);
+        err = clEnqueueReadBuffer(queue, bufferC[op], CL_FALSE, 0, sizeof(int32_t) * SIZE, c[op].data(), 0, nullptr, &read_events[op]);
         if (err != CL_SUCCESS) {
-            std::cerr << "Failed to map buffer C for operation " << op << ": " << err << std::endl;
+            std::cerr << "Failed to enqueue read buffer C for operation " << op << ": " << err << std::endl;
             return 1;
         }
-        std::memcpy(c[op].data(), ptrC, sizeof(int32_t) * SIZE);
-        clEnqueueUnmapMemObject(queue, bufferC[op], ptrC, 0, nullptr, nullptr);
+    }
+
+    // Wait for all read operations to complete
+    clWaitForEvents(read_events.size(), read_events.data());
+    for (auto& event : read_events) {
+        clReleaseEvent(event);
     }
 
     // End timing GPU data transfer (read)
